@@ -71,7 +71,65 @@ CREATE TABLE IF NOT EXISTS seismic_event_audit (
 );
 CREATE INDEX IF NOT EXISTS idx_seismic_obs_event ON seismic_observations(event_id, observed_at);
 CREATE INDEX IF NOT EXISTS idx_seismic_tasks_status ON seismic_computations(status, created_at);
+CREATE TABLE IF NOT EXISTS seismic_param_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_tag TEXT NOT NULL UNIQUE,
+    params_json TEXT NOT NULL,
+    fingerprint TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK(status IN ('active','retired')),
+    created_by TEXT NOT NULL,
+    published_by TEXT,
+    rehearsal_id INTEGER,
+    created_at TEXT NOT NULL,
+    activated_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_seismic_params_single_active
+    ON seismic_param_versions(status) WHERE status='active';
+CREATE TABLE IF NOT EXISTS seismic_param_rehearsals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    status TEXT NOT NULL CHECK(status IN ('pending','approved','rejected','published','expired','failed')),
+    requested_by TEXT NOT NULL,
+    candidate_json TEXT NOT NULL,
+    candidate_fingerprint TEXT NOT NULL,
+    baseline_fingerprint TEXT NOT NULL,
+    baseline_version_tag TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    event_ids_json TEXT NOT NULL,
+    report_json TEXT NOT NULL DEFAULT '{}',
+    decided_by TEXT,
+    decided_at TEXT,
+    decision_reason TEXT NOT NULL DEFAULT '',
+    published_version_tag TEXT,
+    failure_reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_seismic_rehearsal_status ON seismic_param_rehearsals(status, created_at);
+CREATE TABLE IF NOT EXISTS seismic_param_rehearsal_events (
+    rehearsal_id INTEGER NOT NULL REFERENCES seismic_param_rehearsals(id) ON DELETE CASCADE,
+    event_id INTEGER NOT NULL,
+    baseline_digest TEXT NOT NULL,
+    candidate_digest TEXT NOT NULL,
+    points_total INTEGER NOT NULL,
+    points_changed INTEGER NOT NULL,
+    max_abs_delta REAL NOT NULL,
+    mean_abs_delta REAL NOT NULL,
+    baseline_summary_json TEXT NOT NULL,
+    candidate_summary_json TEXT NOT NULL,
+    input_diff_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(rehearsal_id, event_id)
+);
 """
+
+DEFAULT_PARAMS: dict[str, Any] = {
+    "model_version": "gmpe-2026.1",
+    "grid_step_km": 10.0,
+    "radius_km": 100.0,
+    "pga_weight": 0.01,
+    "accepted_score_threshold": 0.6,
+}
+BASELINE_TAG = "baseline-2026.1"
+REHEARSAL_TTL_HOURS = 72
 
 
 def _now() -> str:
@@ -81,6 +139,21 @@ def _now() -> str:
 def ensure_schema() -> None:
     connection = get_connection()
     connection.executescript(SCHEMA)
+    _seed_baseline(connection)
+
+
+def _seed_baseline(connection: sqlite3.Connection) -> None:
+    fingerprint = parameter_fingerprint(DEFAULT_PARAMS)
+    now = _now()
+    connection.execute(
+        "INSERT OR IGNORE INTO seismic_param_versions(version_tag,params_json,fingerprint,status,created_by,published_by,created_at,activated_at) VALUES(?,?,?,?,'system','system',?,?)",
+        (BASELINE_TAG, json.dumps(DEFAULT_PARAMS, ensure_ascii=False, sort_keys=True), fingerprint, "active", now, now),
+    )
+
+
+def parameter_fingerprint(params: dict[str, Any]) -> str:
+    canonical = json.dumps(params, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -184,12 +257,29 @@ class SeismicService:
                 return dict(existing) if existing else {}
             return dict(connection.execute("SELECT * FROM seismic_observations WHERE id=?", (cursor.lastrowid,)).fetchone())
 
+    def _active_params(self) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT params_json FROM seismic_param_versions WHERE status='active' ORDER BY id LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return dict(DEFAULT_PARAMS)
+        return json.loads(row["params_json"])
+
     def _grid(self, event: sqlite3.Row, observations: list[sqlite3.Row], step: float, radius: float) -> list[GridPoint]:
+        params = {**DEFAULT_PARAMS, "grid_step_km": float(step), "radius_km": float(radius)}
+        return self._grid_with_params(event, observations, params)
+
+    @staticmethod
+    def _grid_with_params(event: sqlite3.Row, observations: list[sqlite3.Row], params: dict[str, Any]) -> list[GridPoint]:
+        step = float(params["grid_step_km"])
+        radius = float(params["radius_km"])
+        pga_weight = float(params["pga_weight"])
+        threshold = float(params["accepted_score_threshold"])
         center_lat, center_lon = float(event["latitude"]), float(event["longitude"])
         radius_deg = radius / 111.0
         count = max(1, int(math.floor((radius * 2) / step)))
         result: list[GridPoint] = []
-        accepted = [item for item in observations if item["quality_status"] == "accepted"]
+        accepted = [item for item in observations if float(item["quality_score"]) >= threshold]
         for lat_index in range(count + 1):
             lat = center_lat - radius_deg + lat_index * (step / 111.0)
             for lon_index in range(count + 1):
@@ -198,16 +288,20 @@ class SeismicService:
                 for item in accepted:
                     distance = math.hypot((lat - center_lat) * 111, (lon - center_lon) * 111 * max(0.2, math.cos(math.radians(lat))))
                     weight = 1 / max(1, abs(distance - float(item["distance_km"])))
-                    estimate = float(event["magnitude"]) - math.log10(max(1, float(item["distance_km"]))) + (float(item["pga"] or 0) * 0.01)
+                    estimate = float(event["magnitude"]) - math.log10(max(1, float(item["distance_km"]))) + (float(item["pga"] or 0) * pga_weight)
                     values.append((estimate * weight, weight))
                 intensity = round(sum(value for value, _ in values) / sum(weight for _, weight in values), 3) if values else round(float(event["magnitude"]) - 1, 3)
                 result.append(GridPoint(round(lat, 6), round(lon, 6), intensity))
         return result
 
-    def enqueue_computation(self, event_id: int, model_version: str, grid_step_km: float, radius_km: float, requested_by: str) -> dict[str, Any]:
+    def enqueue_computation(self, event_id: int, model_version: str | None, grid_step_km: float | None, radius_km: float | None, requested_by: str) -> dict[str, Any]:
         event = self.connection.execute("SELECT * FROM seismic_events WHERE id=?", (event_id,)).fetchone()
         if event is None:
             raise KeyError("event_not_found")
+        active = self._active_params()
+        model_version = model_version or active["model_version"]
+        grid_step_km = float(grid_step_km if grid_step_km is not None else active["grid_step_km"])
+        radius_km = float(radius_km if radius_km is not None else active["radius_km"])
         observations = self.connection.execute("SELECT * FROM seismic_observations WHERE event_id=? ORDER BY id", (event_id,)).fetchall()
         digest = _event_digest(event, observations)
         task_key = hashlib.sha256(f"{event_id}:{digest}:{model_version}:{grid_step_km}:{radius_km}".encode()).hexdigest()
@@ -244,6 +338,12 @@ class SeismicService:
             raise KeyError("task_not_owned")
         event = self.connection.execute("SELECT * FROM seismic_events WHERE id=?", (task["event_id"],)).fetchone()
         observations = self.connection.execute("SELECT * FROM seismic_observations WHERE event_id=? ORDER BY id", (task["event_id"],)).fetchall()
-        points = self._grid(event, observations, task["grid_step_km"], task["radius_km"])
+        task_params = {
+            **self._active_params(),
+            "model_version": task["model_version"],
+            "grid_step_km": float(task["grid_step_km"]),
+            "radius_km": float(task["radius_km"]),
+        }
+        points = self._grid_with_params(event, observations, task_params)
         result = {"model_version": task["model_version"], "input_digest": task["input_digest"], "points": [point.__dict__ for point in points], "count": len(points)}
         return self.complete_task(task_id, worker_id, result)

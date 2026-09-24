@@ -38,9 +38,9 @@ class ObservationCreate(BaseModel):
 
 
 class ComputeRequest(BaseModel):
-    model_version: str = Field(default="gmpe-2026.1", min_length=1, max_length=40)
-    grid_step_km: float = Field(default=10, gt=0, le=100)
-    radius_km: float = Field(default=100, gt=0, le=1000)
+    model_version: str | None = Field(default=None, min_length=1, max_length=40)
+    grid_step_km: float | None = Field(default=None, gt=0, le=100)
+    radius_km: float | None = Field(default=None, gt=0, le=1000)
     requested_by: str = Field(default="system", max_length=80)
 
 

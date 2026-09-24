@@ -9,6 +9,7 @@ from app.api import audit, auth, departments_admin, maintenance, metrics, roles,
 from app.core.errors import DomainError
 from app.database import close_connection, init_db
 from app.routers import affairs, announcements, departments, petitions, residents
+from app.seismic.rehearsal_router import router as seismic_rehearsal_router
 from app.seismic.router import router as seismic_router
 from app.seismic.service import ensure_schema as ensure_seismic_schema
 
@@ -49,6 +50,7 @@ app.include_router(announcements.router)
 app.include_router(departments.router)
 app.include_router(petitions.router)
 app.include_router(seismic_router)
+app.include_router(seismic_rehearsal_router)
 
 
 @app.get("/")
