@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import sqlite3
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from app.database import get_connection, transaction
+from app.seismic.engine import BASELINE_PARAMS, GridPoint, classify, grid_points
 
 
 SCHEMA = """
@@ -95,31 +94,16 @@ def _event_digest(event: sqlite3.Row, observations: list[sqlite3.Row]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
-def _quality(observation: dict[str, Any]) -> tuple[float, str, str]:
-    reasons: list[str] = []
-    score = 1.0
-    if observation.get("pga") is None and observation.get("pgv") is None:
-        score = 0.0
-        reasons.append("缺少峰值指标")
-    if observation.get("pga") is not None and observation["pga"] > 20:
-        score -= 0.6
-        reasons.append("PGA 超出量程")
-    if observation.get("pgv") is not None and observation["pgv"] > 300:
-        score -= 0.4
-        reasons.append("PGV 超出量程")
-    if observation.get("distance_km", 0) == 0:
-        score -= 0.2
-        reasons.append("距离为零")
-    score = max(0.0, min(1.0, round(score, 3)))
-    status = "accepted" if score >= 0.6 else "rejected"
-    return score, status, "、".join(reasons) if reasons else "通过基础质量检查"
-
-
-@dataclass(frozen=True)
-class GridPoint:
-    latitude: float
-    longitude: float
-    intensity: float
+def effective_params(connection: sqlite3.Connection | None = None) -> dict[str, Any]:
+    """读取当前生效的烈度参数；预演表尚未初始化时回退到基线常量。"""
+    connection = connection or get_connection()
+    try:
+        row = connection.execute("SELECT params_json FROM seismic_active_params WHERE id=1").fetchone()
+    except sqlite3.OperationalError:
+        return dict(BASELINE_PARAMS)
+    if row is None:
+        return dict(BASELINE_PARAMS)
+    return json.loads(row["params_json"])
 
 
 class SeismicService:
@@ -170,7 +154,7 @@ class SeismicService:
         event = self.connection.execute("SELECT id FROM seismic_events WHERE id=?", (event_id,)).fetchone()
         if event is None:
             raise KeyError("event_not_found")
-        quality_score, quality_status, quality_reason = _quality(payload)
+        quality_score, quality_status, quality_reason = classify(payload, effective_params(self.connection))
         now = _now()
         source_hash = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         with transaction(immediate=True) as connection:
@@ -185,24 +169,9 @@ class SeismicService:
             return dict(connection.execute("SELECT * FROM seismic_observations WHERE id=?", (cursor.lastrowid,)).fetchone())
 
     def _grid(self, event: sqlite3.Row, observations: list[sqlite3.Row], step: float, radius: float) -> list[GridPoint]:
-        center_lat, center_lon = float(event["latitude"]), float(event["longitude"])
-        radius_deg = radius / 111.0
-        count = max(1, int(math.floor((radius * 2) / step)))
-        result: list[GridPoint] = []
+        params = {**effective_params(self.connection), "grid_step_km": float(step), "radius_km": float(radius)}
         accepted = [item for item in observations if item["quality_status"] == "accepted"]
-        for lat_index in range(count + 1):
-            lat = center_lat - radius_deg + lat_index * (step / 111.0)
-            for lon_index in range(count + 1):
-                lon = center_lon - radius_deg + lon_index * (step / 111.0) / max(0.2, math.cos(math.radians(lat)))
-                values = []
-                for item in accepted:
-                    distance = math.hypot((lat - center_lat) * 111, (lon - center_lon) * 111 * max(0.2, math.cos(math.radians(lat))))
-                    weight = 1 / max(1, abs(distance - float(item["distance_km"])))
-                    estimate = float(event["magnitude"]) - math.log10(max(1, float(item["distance_km"]))) + (float(item["pga"] or 0) * 0.01)
-                    values.append((estimate * weight, weight))
-                intensity = round(sum(value for value, _ in values) / sum(weight for _, weight in values), 3) if values else round(float(event["magnitude"]) - 1, 3)
-                result.append(GridPoint(round(lat, 6), round(lon, 6), intensity))
-        return result
+        return grid_points(event, accepted, params)
 
     def enqueue_computation(self, event_id: int, model_version: str, grid_step_km: float, radius_km: float, requested_by: str) -> dict[str, Any]:
         event = self.connection.execute("SELECT * FROM seismic_events WHERE id=?", (event_id,)).fetchone()

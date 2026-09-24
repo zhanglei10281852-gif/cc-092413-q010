@@ -6,6 +6,7 @@
 
 - 震情档案：登记地震事件、震源参数和台站观测，保留计算输入摘要。
 - 科学计算：提供震级、距离和烈度的确定性计算，以及可恢复后台任务。
+- 参数预演：烈度参数升级前先以候选参数集对代表性事件做预演，生成输入差异、结果差异、预计影响范围与权限检查报告，经审批后由具备发布权限的账号原子切换生效版本；重复确认、重复发布与过期候选安全失败，全过程写审计。
 - 灾情协同：管理灾情报告、公告、部门责任和跨部门办理状态。
 - 身份与权限：用户、角色、细粒度权限、会话令牌、账号停用和会话撤销。
 - 审计记录：关键身份操作留痕，并对口令和令牌等敏感字段做过滤。
@@ -54,13 +55,25 @@ curl -sS -X POST http://127.0.0.1:8432/api/auth/bootstrap   -H 'Content-Type: ap
 
 之后通过 `/api/auth/login` 获取会话令牌，并在管理接口请求头中使用 `Authorization: Bearer <token>`。
 
+## 烈度参数预演与发布
+
+升级烈度计算参数不允许直接改生产参数，须按「预演 → 审批 → 发布」推进：
+
+1. 具备 `seismic.params.rehearse` 权限的账号调用 `POST /api/seismic/param-rehearsals` 提交候选参数集（未提供的字段沿用当前生效值），可显式指定代表性事件或由系统挑选观测最丰富的事件。
+2. 服务在内存中分别用生效参数与候选参数计算，返回并持久化报告：`input_diff`（参数差异、观测质量翻转）、逐事件 `result_diff` 与分区（烈度带）摘要差异、`impact_scope`（受影响事件/已发布事件/网格点/烈度带）和 `permission_check`（可发布角色与账号）。此阶段不改动任何生效数据。
+3. 具备 `seismic.params.approve` 权限的审批人通过 `POST /api/seismic/param-rehearsals/{id}/approve` 或 `/reject` 确认或驳回。
+4. 仅具备 `seismic.params.publish` 权限的账号可对 `approved` 候选执行 `POST /api/seismic/param-rehearsals/{id}/publish`；同一候选集（可携带 `expected_digest` 复核）在单事务内原子切换 `GET /api/seismic/params/active`。
+5. 重复确认、重复发布、驳回后发布、未审批发布、摘要不一致与候选过期（默认 24 小时，`TOWNSHIP_SEISMIC_CANDIDATE_TTL_MINUTES` 可调）一律返回 409 安全失败，失败尝试同样写入审计。
+6. 可通过 `GET /api/seismic/param-rehearsals`、`GET /api/seismic/param-rehearsals/{id}`（含完整报告与阶段日志）、`GET /api/seismic/param-rehearsals/{id}/report` 查询预演状态与报告摘要。所有状态持久化，服务重启后未完成的预演仍是 `staged/approved`，不会自动变成已发布。
+
+
 ## 测试
 
 ```bash
 python -m pytest
 ```
 
-测试覆盖身份初始化、登录、用户与角色维护、权限计算、账号停用后的会话撤销、审计脱敏、事件与台站观测、烈度计算、后台任务去重与领取，以及数据库时间格式。
+测试覆盖身份初始化、登录、用户与角色维护、权限计算、账号停用后的会话撤销、审计脱敏、事件与台站观测、烈度计算、后台任务去重与领取，以及烈度参数预演、审批、原子发布、重复/过期安全失败、重启恢复和数据库时间格式。
 
 ## 编译检查
 

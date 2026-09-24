@@ -48,3 +48,33 @@ class TaskComplete(BaseModel):
     worker_id: str = Field(..., min_length=1, max_length=80)
     result: dict = Field(default_factory=dict)
 
+
+class CandidateParams(BaseModel):
+    model_version: str | None = Field(default=None, min_length=1, max_length=40)
+    grid_step_km: float | None = Field(default=None, gt=0, le=100)
+    radius_km: float | None = Field(default=None, gt=0, le=1000)
+    pga_limit: float | None = Field(default=None, gt=0, le=100)
+    pgv_limit: float | None = Field(default=None, gt=0, le=500)
+    quality_accept_score: float | None = Field(default=None, ge=0, le=1)
+    pga_weight: float | None = Field(default=None, ge=0, le=1)
+
+    def changed_fields(self) -> dict:
+        return self.model_dump(exclude_none=True)
+
+
+class RehearsalCreate(BaseModel):
+    candidate: CandidateParams
+    event_ids: list[int] | None = Field(default=None, max_length=20)
+    sample_limit: int = Field(default=5, ge=1, le=20)
+    ttl_minutes: int | None = Field(default=None, ge=1, le=7 * 24 * 60)
+    reason: str = Field(default="", max_length=300)
+
+
+class RehearsalDecision(BaseModel):
+    reason: str = Field(default="", max_length=500)
+
+
+class RehearsalPublish(BaseModel):
+    # 发布人可携带预演报告中的候选摘要，服务端会校验与落库候选集完全一致才切换。
+    expected_digest: str | None = Field(default=None, min_length=16, max_length=128)
+

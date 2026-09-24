@@ -233,6 +233,10 @@ PERMISSIONS = [
     ("announcements.write", "维护公告", "announcements", "write"),
     ("audit.read", "查看审计", "audit", "read"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
+    ("seismic.params.read", "查看烈度参数预演", "seismic_params", "read"),
+    ("seismic.params.rehearse", "发起烈度参数预演", "seismic_params", "rehearse"),
+    ("seismic.params.approve", "审批烈度参数候选", "seismic_params", "approve"),
+    ("seismic.params.publish", "发布烈度参数版本", "seismic_params", "publish"),
 ]
 
 
